@@ -17,7 +17,7 @@ class AuthenticationFailedError(APICallError):
               " correctly and includes the signature."
 
 
-class InternalErrorError(APICallError):
+class InternalError(APICallError):
     status_int = 500
     message = "(Internal Server Error) The server encountered an internal error." \
               " Please retry the request."

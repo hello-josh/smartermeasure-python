@@ -1,7 +1,15 @@
+from .errors import *
 import requests
-from smartermeasure import (USERS_QUERY_PARAMS, USERS_ENDPOINT, SIGNON_ENDPOINT,
-                            REPORTLINK_ENDPOINT, RESULTS_QUERY_PARAMS, RESULTS_ENDPOINT)
-from smartermeasure.errors import QueryStringError, MissingUserIdError
+
+USERS_ENDPOINT = 'https://api.smartermeasure.com/v3/users'
+USERS_QUERY_PARAMS = {'UserId', 'InternalID', 'Email', 'FirstName', 'LastName', 'AccessCode', 'OrderBy',
+                      'ExcludeCustomQuestions', 'PageSize', 'Page', 'AssessmentKey', 'AdministrativeGroupKey'}
+RESULTS_ENDPOINT = 'https://api.smartermeasure.com/v3/results'
+RESULTS_QUERY_PARAMS = {'UserID', 'InternalID', 'FirstName', 'LastName', 'EmailAddress', 'Gender',
+                        'AdminGroupUserName', 'TestingGroupUserName', 'ExtendedData', 'IncludeAccountRequestedData',
+                        'StartDate', 'EndDate', 'UpdateStartDate', 'UpdateEndDate', 'StartRecord', 'EndRecord'}
+SIGNON_ENDPOINT = 'https://api.smartermeasure.com/v3/users/{user_id}/signon'
+REPORTLINK_ENDPOINT = 'https://api.smartermeasure.com/v3/users/{user_id}/reportlink'
 
 
 class Client(object):
@@ -22,7 +30,22 @@ class Client(object):
         :param result: API response
         :type result: requests.Response
         """
-        return result.status_code
+        if result.status_code < 400:
+            return
+        data = result.json()
+        ex = data.get("RestException", {})
+        error_map = {
+            "InvalidInput": InvalidInputError,
+            "AuthenticationFailed": AuthenticationFailedError,
+            "InternalError": InternalError,
+            "InvalidAuthenticationInfo": InvalidAuthenticationInfoError,
+            "InvalidProtocol": InvalidProtocolError,
+            "InvalidUri": InvalidUriError,
+            "ResourceNotFound": ResourceNotFoundError,
+            "UnsupportedHttpVerb": UnsupportedHttpVerbError
+        }
+        cls = error_map.get(ex.get('Code'), APICallError)
+        raise cls(ex.get('Status', 500), ex.get('ExtendedDetails', "Unknown Internal Error"))
 
 
 class SmarterMeasure(object):
@@ -35,11 +58,29 @@ class SmarterMeasure(object):
             self.client = client
             self.user_id = user_id
 
-        def get(self):
+        def __call__(self, *args, **kwargs):
+            if len(**kwargs):
+                return self.search(**kwargs)
+            if len(args):
+                # allow users(1) to return a new Users object with the new user_id
+                return self.__class__(self.client, user_id=args[0])
             if not self.user_id:
                 raise MissingUserIdError()
             r = self.client('GET', USERS_ENDPOINT + '/' + self.user_id)
-            return r.json()
+            self._data = r.json()
+            return self
+        get = __call__
+
+        def __getitem__(self, item):
+            """Allows dict access to object for user's details"""
+            return self.data.__getitem__(item)
+        __getattr__ = __getitem__
+
+        @property
+        def data(self):
+            if getattr(self, '_data'):
+                return self._data
+            return self()
 
         def search(self, **kwargs):
             """Searches for users
@@ -64,7 +105,21 @@ class SmarterMeasure(object):
                 raise QueryStringError("Parameter(s) %s" % unknowns)
 
             r = self.client('GET', USERS_ENDPOINT, params=kwargs)
-            return r.json()
+            result = r.json()
+            if int(result['Total']):
+                # map user `dict`s to `User` objects
+                if isinstance(result['User'], list):
+                    users = []
+                    for u in result['User']:
+                        new_user = self.__class__(self.client, u['UserId'])
+                        new_user._data = u
+                        users.append(new_user)
+                    result['User'] = users
+                else:
+                    new_user = self.__class__(self.client, result['User']['UserId'])
+                    new_user._data = result['User']
+                    result['User'] = new_user
+            return result
 
         def sign_on(self, ssl=True, include_settings=False, redirect_to_section=None):
             if not self.user_id:
@@ -73,23 +128,25 @@ class SmarterMeasure(object):
             if redirect_to_section:
                 data['RedirectToSection'] = redirect_to_section
             r = self.client('POST', SIGNON_ENDPOINT.format(user_id=self.user_id), data=data)
-            return r.json()
+            response = r.json()
+            return response['RedirectUrl']
 
         def report_link(self):
             if not self.user_id:
                 raise MissingUserIdError()
-            r = self.client('GET', REPORTLINK_ENDPOINT.format(self.user_id))
-            return r.json()
+            r = self.client('GET', REPORTLINK_ENDPOINT.format(user_id=self.user_id))
+            response = r.json()
+            return response['EntryLink']
 
     def user(self, user_id):
         """Gets a User by Id
 
         :param user_id: The user id
         :type user_id: str
-        :return: User details
-        :rtype: dict
+        :return: The user
+        :rtype: smartermeasure.api.SmarterMeasure.Users
         """
-        return self.Users(self.client, user_id=user_id).get()
+        return self.Users(self.client, user_id=user_id)
 
     def users(self, **kwargs):
         """Searches for users
@@ -109,6 +166,33 @@ class SmarterMeasure(object):
             AdministrativeGroupKey  The primary Administrative Group Key that is assigned to the assessment to filter by. This can be a comma delimited string of keys to search within.
         """
         return self.Users(self.client).search(**kwargs)
+
+    def register(self, first_name, last_name, email, group_key, gender=None, internal_id=None):
+        """Registers a user with SmarterMeasure
+
+        :param first_name: User's first name
+        :type first_name: str
+        :param last_name: The user's last name
+        :type last_name: str
+        :param email: The user's email
+        :type email: str
+        :param group_key: Key to match with the proper assessment
+        :type group_key: str
+        :param gender: M or F
+        :type gender: str
+        :param internal_id: Consumer's internal ID for the user
+        :type internal_id: str
+        :return: The new user object
+        :rtype: Users
+        """
+        data = {'GroupKey': group_key, 'FirstName': first_name,
+                'LastName': last_name, 'Email': email}
+        if gender:
+            data['Gender'] = gender
+        if internal_id:
+            data['InternalID'] = internal_id
+        r = self.client('POST', USERS_ENDPOINT, data=data)
+        return self.Users(self.client, user_id=r.json()['UserId'])
 
     def results(self, **kwargs):
         """Searches for assessment results
